@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
+import argparse
+import time
 
 import requests
 """
@@ -186,7 +188,7 @@ def post_to_slack(
     resp.raise_for_status()
 
 
-def main() -> int:
+def run_once() -> int:
     if not SLACK_WEBHOOK_URL:
         print("ERROR: SLACK_WEBHOOK_URL env var is required.", file=sys.stderr)
         return 2
@@ -289,5 +291,47 @@ def main() -> int:
     return 0
 
 
+def cli_main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loop", action="store_true", help="Run forever (daemon mode)")
+    parser.add_argument("--interval-sec", type=int, default=60, help="Polling interval in seconds")
+    args = parser.parse_args()
+
+    if not args.loop:
+        return run_once()
+
+    # k8s 종료(SIGTERM) 들어오면 while 탈출하도록 처리
+    keep_running = True
+
+    def _handle_sigterm(signum, frame):
+        nonlocal keep_running
+        keep_running = False
+
+    try:
+        import signal
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+        signal.signal(signal.SIGINT, _handle_sigterm)
+    except Exception:
+        pass
+
+    while keep_running:
+        try:
+            rc = run_once()
+            # run_once가 2(설정오류) 같은 치명적 오류면 계속 돌 의미가 없으니 종료
+            if rc != 0 and rc != 0:
+                pass
+        except Exception as e:
+            print(f"ERROR: run_once failed: {e}", file=sys.stderr)
+
+        # sleep 중에도 SIGTERM 받으면 빨리 종료되도록 1초 단위로 쪼갬
+        for _ in range(max(1, args.interval_sec)):
+            if not keep_running:
+                break
+            time.sleep(1)
+
+    print("Exiting daemon loop.")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
