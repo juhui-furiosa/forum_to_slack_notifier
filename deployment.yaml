@@ -19,7 +19,7 @@ spec:
         furiosa.ai/nodegroup: ondemand-light
       containers:
       - name: forum-watcher
-        image: 408994520673.dkr.ecr.ap-northeast-2.amazonaws.com/tech-sales/forum-watcher:v0.0.3
+        image: 408994520673.dkr.ecr.ap-northeast-2.amazonaws.com/tech-sales/forum-watcher:v0.0.4
         env:
           - name: SLACK_WEBHOOK_URL
             valueFrom:

@@ -119,7 +119,25 @@ def fetch_latest_pages(max_pages: int = 200) -> Tuple[List[Dict[str, Any]], Dict
         pages += 1
 
     return list(topics_by_id.values()), users_by_id
-
+ 
+def normalize_tags(raw: Any) -> List[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        out = []
+        for x in raw:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, dict):
+                # dict면 name/slug 같은 키를 우선 사용
+                out.append(str(x.get("name") or x.get("slug") or x))
+            else:
+                out.append(str(x))
+        return out
+    # tags가 list가 아닌 경우도 방어
+    if isinstance(raw, str):
+        return [raw]
+    return [str(raw)]
 
 def topic_url(topic: Dict[str, Any]) -> str:
     slug = topic.get("slug") or "topic"
@@ -161,7 +179,7 @@ def post_to_slack(
 ) -> None:
     mention = "@channel"  # @here 원하면 "@here"로 바꾸기
 
-    tags_text = ", ".join(tags) if tags else "-"
+    tags_text = ", ".join(map(str, tags)) if tags else "-"
     activity_line = "New topic" if delta_posts <= 0 else f"New replies: `+{delta_posts}`"
 
     payload = {
@@ -232,9 +250,7 @@ def run_once() -> int:
         title = t.get("title", "(no title)")
         url = topic_url(t)
 
-        tags = t.get("tags") or []
-        if not isinstance(tags, list):
-            tags = []
+        tags = normalize_tags(t.get("tags"))
 
         author_username, author_name = get_original_poster(t, users_by_id)
 
@@ -318,10 +334,13 @@ def cli_main() -> int:
         try:
             rc = run_once()
             # run_once가 2(설정오류) 같은 치명적 오류면 계속 돌 의미가 없으니 종료
-            if rc != 0 and rc != 0:
-                pass
-        except Exception as e:
-            print(f"ERROR: run_once failed: {e}", file=sys.stderr)
+            if rc == 2:
+                print("Fatal config error. Exiting.", file=sys.stderr)
+                break
+        except Exception:
+            import traceback
+            print("ERROR: run_once failed.", file=sys.stderr)
+            traceback.print_exc()
 
         # sleep 중에도 SIGTERM 받으면 빨리 종료되도록 1초 단위로 쪼갬
         for _ in range(max(1, args.interval_sec)):
