@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forum-watcher
+  namespace: group-tech-sales
+  labels:
+    app: forum-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forum-watcher
+  template:
+    metadata:
+      labels:
+        app: forum-watcher
+    spec:
+      nodeSelector:
+        furiosa.ai/nodegroup: ondemand-light
+      containers:
+      - name: forum-watcher
+        image: 408994520673.dkr.ecr.ap-northeast-2.amazonaws.com/tech-sales/forum-watcher:v0.0.4
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: forum-watcher-secret
+                key: SLACK_WEBHOOK_URL
+          - name: TZ
+            value: Asia/Seoul
+          - name: STATE_PATH
+            value: /data/forum_notifier_state.json
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        volumeMounts:
+          - name: state
+            mountPath: /data
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: forum-watcher-state-pvc
