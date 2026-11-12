@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
@@ -25,6 +26,11 @@ LATEST_JSON_URL = f"{FORUM_BASE}/latest.json"
 
 STATE_PATH = os.environ.get("STATE_PATH", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+# 댓글 알림을 원글 알림의 스레드로 달기 위해, 웹훅이 올린 원글 메시지를 찾는 데만 쓰는 봇 토큰(읽기).
+# 둘 중 하나라도 없으면 예전처럼 댓글도 채널에 올린다.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+FORUM_CHANNEL_ID = os.environ.get("FORUM_CHANNEL_ID", "")
+THREAD_LOOKUP_PAGES = 10  # 원글 메시지를 찾을 때 최근 메시지 몇 페이지(200개씩)까지 볼지
 
 TIMEOUT_SEC = 15
 MAX_PAGES = 3  # latest.json은 페이지당 고정 개수(30개)라, 누락 방지하려면 pages를 늘릴 수 있음
@@ -226,6 +232,7 @@ def post_to_slack(
     tags: List[str],
     delta_posts: int,
     dry_run: bool = False,
+    thread_ts: Optional[str] = None,
 ) -> None:
     mention = "@channel"  # @here 원하면 "@here"로 바꾸기
 
@@ -235,7 +242,8 @@ def post_to_slack(
     if dry_run:
         print(
             "[DRY-RUN] Slack 미전송. 실제로 보냈을 내용:\n"
-            f"  {mention} {title}\n"
+            + (f"  (thread reply to {thread_ts})\n" if thread_ts else "")
+            + f"  {mention if not thread_ts else ''} {title}\n"
             f"  URL: {url}\n"
             f"  Author: {author_name} (@{author_username})\n"
             f"  Tags: {tags_text}\n"
@@ -264,8 +272,66 @@ def post_to_slack(
         ]
     }
 
+    if thread_ts:
+        # 원글 알림의 스레드 답글: 채널 전체 알림(@channel)과 큰 제목은 빼고 같은 내용만
+        payload = {
+            "thread_ts": thread_ts,
+            "text": f"{activity_line.replace('`', '')} - {title}",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*<{url}|{title}>*\n"
+                            f"• Author: `{author_name}`\n"
+                            f"• Type: {activity_line}\n"
+                            f"• Time: `{event_time}`"
+                        ),
+                    },
+                },
+            ],
+        }
+
+    # 포럼 링크 미리보기(본문 카드)는 붙이지 않음
+    payload["unfurl_links"] = False
+    payload["unfurl_media"] = False
+
     resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT_SEC)
     resp.raise_for_status()
+
+
+def find_topic_message_ts(tid: int) -> Optional[str]:
+    """채널에서 이 topic 의 원글 알림(New topic) 메시지 ts 를 찾는다. 없으면 가장 오래된 같은 글 알림, 그것도 없으면 None."""
+    if not (SLACK_BOT_TOKEN and FORUM_CHANNEL_ID):
+        return None
+    pat = re.compile(r"forums\.furiosa\.ai/t/[^/|>\s]+/%d(?:[|>/]|$)" % tid)
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    found: Optional[str] = None
+    cursor = None
+    for _ in range(THREAD_LOOKUP_PAGES):
+        params: Dict[str, Any] = {"channel": FORUM_CHANNEL_ID, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = requests.get("https://slack.com/api/conversations.history", headers=headers,
+                                params=params, timeout=TIMEOUT_SEC).json()
+        except Exception as e:
+            print(f"WARN: conversations.history failed: {e}", file=sys.stderr)
+            return found
+        if not data.get("ok"):
+            print(f"WARN: conversations.history failed: {data.get('error')}", file=sys.stderr)
+            return found
+        for m in data.get("messages") or []:  # 최신순
+            blob = (m.get("text") or "") + json.dumps(m.get("blocks") or [], ensure_ascii=False).replace("\\/", "/")
+            if pat.search(blob):
+                found = m["ts"]
+                if "New topic" in blob:
+                    return found
+        cursor = (data.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    return found
 
 
 def run_once(dry_run: bool = False) -> int:
@@ -370,6 +436,11 @@ def run_once(dry_run: bool = False) -> int:
 
             event_time = t.get("last_posted_at") or t.get("bumped_at") or now_utc_iso()
 
+            thread_map: Dict[str, str] = state.setdefault("topic_thread_ts", {})
+            thread_ts = thread_map.get(str(tid)) or find_topic_message_ts(tid)
+            if thread_ts:
+                thread_map[str(tid)] = thread_ts
+
             post_to_slack(
                 SLACK_WEBHOOK_URL,
                 title=title,
@@ -380,8 +451,9 @@ def run_once(dry_run: bool = False) -> int:
                 tags=tags,
                 delta_posts=delta,
                 dry_run=dry_run,
+                thread_ts=thread_ts,
             )
-            print(f"Notified replies: {tid} {title} (+{delta})")
+            print(f"Notified replies: {tid} {title} (+{delta})" + (f" in thread {thread_ts}" if thread_ts else ""))
             notified += 1
 
         # 증가/감소(글 삭제) 무관하게 항상 최신값으로 동기화.
