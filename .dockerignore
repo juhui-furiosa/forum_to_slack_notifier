@@ -1,0 +1,10 @@
+.env
+*.log
+cron.log
+notifier.log
+forum_notifier_state.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
