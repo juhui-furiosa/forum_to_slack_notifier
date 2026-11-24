@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+from html import escape
 from typing import Any, Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 import argparse
@@ -19,6 +20,7 @@ import requests
 새 글: 처음 보는 topic 이고 created_at 이 초기화 시점 이후면 알림 (저자 = 원글 작성자)
 새 댓글: highest_post_number 가 이전보다 커지면 알림 (저자 = 최근 작성자)
 저장값은 증가/감소 무관하게 항상 현재 highest_post_number 로 동기화합니다.
+알림은 매일 09:00~19:00 KST에 발생 시각순으로 게시하고, 그 외 시간에는 상태 파일에 보관합니다.
 """
 
 FORUM_BASE = "https://forums.furiosa.ai"
@@ -31,10 +33,13 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 FORUM_CHANNEL_ID = os.environ.get("FORUM_CHANNEL_ID", "")
 THREAD_LOOKUP_PAGES = 10  # 원글 메시지를 찾을 때 최근 메시지 몇 페이지(200개씩)까지 볼지
+QUEUED_THREAD_LOOKUP_RETRIES = 2
 
 TIMEOUT_SEC = 15
 MAX_PAGES = 3  # latest.json은 페이지당 고정 개수(30개)라, 누락 방지하려면 pages를 늘릴 수 있음
 KST = ZoneInfo("Asia/Seoul")
+POSTING_START_HOUR = 9
+POSTING_END_HOUR = 19
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -47,6 +52,11 @@ def iso_utc_to_kst_str(ts: str) -> str:
 
 def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def is_posting_time() -> bool:
+    local_hour = parse_iso(now_utc_iso()).astimezone(KST).hour
+    return POSTING_START_HOUR <= local_hour < POSTING_END_HOUR
 
 
 def load_state() -> Dict[str, Any]:
@@ -252,6 +262,8 @@ def post_to_slack(
         )
         return
 
+    slack_title = escape(title, quote=False)
+    title_link = f"*<{url}|{slack_title}>*"
     payload = {
         "blocks": [
             {"type": "header", "text": {"type": "plain_text", "text": "📢 New activity on FuriosaAI Forum"}},
@@ -260,7 +272,7 @@ def post_to_slack(
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"{mention} *<{url}|{title}>*\n"
+                        f"{mention} {title_link}\n"
                         f"• Author: `{author_name}`\n"
                         f"• Tags: `{tags_text}`\n"
                         f"• Type: {activity_line}\n"
@@ -276,14 +288,14 @@ def post_to_slack(
         # 원글 알림의 스레드 답글: 채널 전체 알림(@channel)과 큰 제목은 빼고 같은 내용만
         payload = {
             "thread_ts": thread_ts,
-            "text": f"{activity_line.replace('`', '')} - {title}",
+            "text": f"{activity_line.replace('`', '')} - {slack_title}",
             "blocks": [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"*<{url}|{title}>*\n"
+                            f"{title_link}\n"
                             f"• Author: `{author_name}`\n"
                             f"• Type: {activity_line}\n"
                             f"• Time: `{event_time}`"
@@ -297,8 +309,12 @@ def post_to_slack(
     payload["unfurl_links"] = False
     payload["unfurl_media"] = False
 
-    resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT_SEC)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT_SEC)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        reason = f"HTTP {exc.response.status_code}" if exc.response is not None else type(exc).__name__
+        raise RuntimeError(f"Slack webhook delivery failed ({reason})") from None
 
 
 def find_topic_message_ts(tid: int) -> Optional[str]:
@@ -334,6 +350,57 @@ def find_topic_message_ts(tid: int) -> Optional[str]:
     return found
 
 
+def flush_notifications(state: Dict[str, Any], dry_run: bool) -> int:
+    pending = state.get("pending_notifications", [])
+    if not pending:
+        return 0
+
+    pending.sort(key=lambda event: parse_iso(event["event_time"]))
+    thread_map = state.setdefault("topic_thread_ts", {})
+    notified = 0
+
+    while pending and is_posting_time():
+        event = pending[0]
+        tid = event["topic_id"]
+        delta = event["delta_posts"]
+        thread_ts = None
+        if delta:
+            thread_ts = thread_map.get(str(tid)) or find_topic_message_ts(tid)
+            if not is_posting_time():
+                break
+            if thread_ts:
+                thread_map[str(tid)] = thread_ts
+            elif event.get("thread_lookup_retries") and SLACK_BOT_TOKEN and FORUM_CHANNEL_ID and not dry_run:
+                # 함께 대기하던 원글이 Slack 조회에 나타날 때까지 잠시 기다린다.
+                event["thread_lookup_retries"] -= 1
+                save_state(state)
+                break
+
+        post_to_slack(
+            SLACK_WEBHOOK_URL,
+            title=event["title"],
+            url=event["url"],
+            event_time=iso_utc_to_kst_str(event["event_time"]),
+            author_username=event["author_username"],
+            author_name=event["author_name"],
+            tags=event["tags"],
+            delta_posts=delta,
+            dry_run=dry_run,
+            thread_ts=thread_ts,
+        )
+        pending.pop(0)
+        if not dry_run:
+            save_state(state)
+        if delta:
+            thread = f" in thread {thread_ts}" if thread_ts else ""
+            print(f"Notified replies: {tid} {event['title']} (+{delta}){thread}")
+        else:
+            print(f"Notified new topic: {tid} {event['title']}")
+        notified += 1
+
+    return notified
+
+
 def run_once(dry_run: bool = False) -> int:
     if not STATE_PATH:
         print("ERROR: STATE_PATH env var is required.", file=sys.stderr)
@@ -347,9 +414,14 @@ def run_once(dry_run: bool = False) -> int:
 
     state = load_state()
 
-    topics, users_by_id = fetch_latest_pages()
+    try:
+        topics, users_by_id = fetch_latest_pages()
+    except requests.RequestException:
+        flush_notifications(state, dry_run)
+        raise
     if not topics:
         print("No topics found.")
+        flush_notifications(state, dry_run)
         return 0
 
     def highest_post_number(t: Dict[str, Any]) -> int:
@@ -383,88 +455,52 @@ def run_once(dry_run: bool = False) -> int:
 
     initialized_at = parse_iso(state["initialized_at"])
     topic_highest: Dict[str, int] = state.get("topic_highest_post_number", {}) or {}
-
-    def activity_key(t: Dict[str, Any]) -> str:
-        return t.get("last_posted_at") or t.get("bumped_at") or t.get("created_at") or ""
-
-    topics.sort(key=activity_key)
-
-    notified = 0
+    pending = state.setdefault("pending_notifications", [])
+    pending_topic_ids = {event["topic_id"] for event in pending if not event["delta_posts"]}
 
     for t in topics:
         tid = int(t.get("id", 0))
         if not tid:
             continue
 
-        title = t.get("title", "(no title)")
-        url = topic_url(t)
-
-        tags = normalize_tags(t.get("tags"))
-
         current_hpn = highest_post_number(t)
         prev_hpn = topic_highest.get(str(tid))
 
+        # 글 삭제로 감소한 경우도 최신값을 저장해야 이후 댓글을 놓치지 않는다.
+        topic_highest[str(tid)] = current_hpn
         if prev_hpn is None:
-            # 처음 보는 topic: baseline 세팅. init 이후 생성된 글이면 새 글 알림.
-            topic_highest[str(tid)] = current_hpn
-
-            created_at_raw = t.get("created_at")
-            if created_at_raw:
-                created_at = parse_iso(created_at_raw)
-                if created_at > initialized_at:
-                    author_username, author_name = get_original_poster(t, users_by_id)
-                    post_to_slack(
-                        SLACK_WEBHOOK_URL,
-                        title=title,
-                        url=url,
-                        event_time=iso_utc_to_kst_str(created_at_raw),
-                        author_username=author_username,
-                        author_name=author_name,
-                        tags=tags,
-                        delta_posts=0,
-                        dry_run=dry_run,
-                    )
-                    print(f"Notified new topic: {tid} {title}")
-                    notified += 1
+            event_time = t.get("created_at")
+            if not event_time or parse_iso(event_time) <= initialized_at:
+                continue
+            delta = 0
+            author_username, author_name = get_original_poster(t, users_by_id)
+        elif current_hpn > prev_hpn:
+            delta = current_hpn - prev_hpn
+            author_username, author_name = get_latest_poster(t, users_by_id)
+            event_time = t.get("last_posted_at") or t.get("bumped_at") or now_utc_iso()
+        else:
             continue
 
-        if current_hpn > prev_hpn:
-            delta = current_hpn - prev_hpn
-
-            # 답글 알림은 원글 작성자가 아니라 실제 최근 작성자를 저자로 표기
-            author_username, author_name = get_latest_poster(t, users_by_id)
-
-            event_time = t.get("last_posted_at") or t.get("bumped_at") or now_utc_iso()
-
-            thread_map: Dict[str, str] = state.setdefault("topic_thread_ts", {})
-            thread_ts = thread_map.get(str(tid)) or find_topic_message_ts(tid)
-            if thread_ts:
-                thread_map[str(tid)] = thread_ts
-
-            post_to_slack(
-                SLACK_WEBHOOK_URL,
-                title=title,
-                url=url,
-                event_time=iso_utc_to_kst_str(event_time),
-                author_username=author_username,
-                author_name=author_name,
-                tags=tags,
-                delta_posts=delta,
-                dry_run=dry_run,
-                thread_ts=thread_ts,
-            )
-            print(f"Notified replies: {tid} {title} (+{delta})" + (f" in thread {thread_ts}" if thread_ts else ""))
-            notified += 1
-
-        # 증가/감소(글 삭제) 무관하게 항상 최신값으로 동기화.
-        # max() 로 감추지 않으므로, 삭제 후 재작성된 글도 정상 감지됨.
-        topic_highest[str(tid)] = current_hpn
+        event = {
+            "topic_id": tid,
+            "title": t.get("title", "(no title)"),
+            "url": topic_url(t),
+            "event_time": event_time,
+            "author_username": author_username,
+            "author_name": author_name,
+            "tags": normalize_tags(t.get("tags")),
+            "delta_posts": delta,
+        }
+        if delta and tid in pending_topic_ids:
+            event["thread_lookup_retries"] = QUEUED_THREAD_LOOKUP_RETRIES
+        pending.append(event)
 
     state["topic_highest_post_number"] = topic_highest
     if not dry_run:
         save_state(state)
 
-    print(f"Done. notified={notified}" + (" (dry-run, 상태 미저장)" if dry_run else ""))
+    notified = flush_notifications(state, dry_run)
+    print(f"Done. notified={notified} queued={len(pending)}" + (" (dry-run, 상태 미저장)" if dry_run else ""))
     return 0
 
 
@@ -478,6 +514,7 @@ def cli_main() -> int:
     if not args.loop:
         return run_once(dry_run=args.dry_run)
 
+    print(f"Posting window: {POSTING_START_HOUR:02d}:00-{POSTING_END_HOUR:02d}:00 KST")
     # k8s 종료(SIGTERM) 들어오면 while 탈출하도록 처리
     keep_running = True
 
