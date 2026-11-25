@@ -2,27 +2,44 @@
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from html import escape
 from typing import Any, Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
+import argparse
+import time
 
 import requests
 """
 맨처음 실행 시, forumn_notifier_state.json 을 세팅해서 지금 포럼 글의 상태를 저장합니다. 이후 실행 시에는 그 상태와 비교하여 새 글이나 새 댓글이 있으면 슬랙으로 알림을 보냅니다.
-새 글: topic_posts_count 에 topic_id 추가, 알림
-새 댓글: /latest.json의 하나의 post에 대해 posts_count 가 증가했으면 있던 topic_id 의 posts_count 증가, 알림
+
+감지 기준은 topic 별 highest_post_number 입니다. (posts_count 는 글 삭제 시 감소해서,
+'중간 글 삭제 후 재작성' 같은 경우 알림을 놓칠 수 있어 사용하지 않습니다.)
+새 글: 처음 보는 topic 이고 created_at 이 초기화 시점 이후면 알림 (저자 = 원글 작성자)
+새 댓글: highest_post_number 가 이전보다 커지면 알림 (저자 = 최근 작성자)
+저장값은 증가/감소 무관하게 항상 현재 highest_post_number 로 동기화합니다.
+알림은 매일 09:00~19:00 KST에 발생 시각순으로 게시하고, 그 외 시간에는 상태 파일에 보관합니다.
 """
 
 FORUM_BASE = "https://forums.furiosa.ai"
 LATEST_JSON_URL = f"{FORUM_BASE}/latest.json"
 
-STATE_PATH = os.environ["STATE_PATH"]
-SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+STATE_PATH = os.environ.get("STATE_PATH", "")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+# 댓글 알림을 원글 알림의 스레드로 달기 위해, 웹훅이 올린 원글 메시지를 찾는 데만 쓰는 봇 토큰(읽기).
+# 둘 중 하나라도 없으면 예전처럼 댓글도 채널에 올린다.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+FORUM_CHANNEL_ID = os.environ.get("FORUM_CHANNEL_ID", "")
+THREAD_LOOKUP_PAGES = 10  # 원글 메시지를 찾을 때 최근 메시지 몇 페이지(200개씩)까지 볼지
+QUEUED_THREAD_LOOKUP_RETRIES = 2
 
 TIMEOUT_SEC = 15
 MAX_PAGES = 3  # latest.json은 페이지당 고정 개수(30개)라, 누락 방지하려면 pages를 늘릴 수 있음
 KST = ZoneInfo("Asia/Seoul")
+POSTING_START_HOUR = 9
+POSTING_END_HOUR = 19
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -37,6 +54,11 @@ def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+def is_posting_time() -> bool:
+    local_hour = parse_iso(now_utc_iso()).astimezone(KST).hour
+    return POSTING_START_HOUR <= local_hour < POSTING_END_HOUR
+
+
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
         return {"initialized_at": None, "topic_posts_count": {}}
@@ -49,6 +71,9 @@ def load_state() -> Dict[str, Any]:
         state["initialized_at"] = None
     if "topic_posts_count" not in state:
         state["topic_posts_count"] = {}
+    # 신규: 삭제에 강건한 highest_post_number 기반 추적
+    if "topic_highest_post_number" not in state:
+        state["topic_highest_post_number"] = {}
 
     return state
 
@@ -117,7 +142,25 @@ def fetch_latest_pages(max_pages: int = 200) -> Tuple[List[Dict[str, Any]], Dict
         pages += 1
 
     return list(topics_by_id.values()), users_by_id
-
+ 
+def normalize_tags(raw: Any) -> List[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        out = []
+        for x in raw:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, dict):
+                # dict면 name/slug 같은 키를 우선 사용
+                out.append(str(x.get("name") or x.get("slug") or x))
+            else:
+                out.append(str(x))
+        return out
+    # tags가 list가 아닌 경우도 방어
+    if isinstance(raw, str):
+        return [raw]
+    return [str(raw)]
 
 def topic_url(topic: Dict[str, Any]) -> str:
     slug = topic.get("slug") or "topic"
@@ -147,6 +190,48 @@ def get_original_poster(topic: Dict[str, Any], users_by_id: Dict[int, Dict[str, 
     return (username, name)
 
 
+def get_latest_poster(topic: Dict[str, Any], users_by_id: Dict[int, Dict[str, Any]]) -> Tuple[str, str]:
+    """가장 최근에 글(답글)을 쓴 작성자를 반환. 답글 알림의 실제 저자 표기용."""
+    posters = topic.get("posters") or []
+    latest_user_id: Optional[int] = None
+
+    # 1순위: extras 에 "latest" 표시가 있는 poster
+    for p in posters:
+        extras = (p.get("extras") or "").lower()
+        if "latest" in extras:
+            try:
+                latest_user_id = int(p.get("user_id"))
+                break
+            except Exception:
+                pass
+
+    # 2순위: description 에 "most recent" / "latest" 가 있는 poster
+    if latest_user_id is None:
+        for p in posters:
+            desc = (p.get("description") or "").lower()
+            if "most recent" in desc or "latest" in desc:
+                try:
+                    latest_user_id = int(p.get("user_id"))
+                    break
+                except Exception:
+                    pass
+
+    # 3순위: 마지막 poster (관례상 가장 최근 작성자)
+    if latest_user_id is None and posters:
+        try:
+            latest_user_id = int(posters[-1].get("user_id"))
+        except Exception:
+            latest_user_id = None
+
+    if latest_user_id is None:
+        return ("unknown", "Unknown")
+
+    u = users_by_id.get(latest_user_id) or {}
+    username = u.get("username") or "unknown"
+    name = u.get("name") or username
+    return (username, name)
+
+
 def post_to_slack(
     webhook_url: str,
     title: str,
@@ -156,12 +241,29 @@ def post_to_slack(
     author_name: str,
     tags: List[str],
     delta_posts: int,
+    dry_run: bool = False,
+    thread_ts: Optional[str] = None,
 ) -> None:
     mention = "@channel"  # @here 원하면 "@here"로 바꾸기
 
-    tags_text = ", ".join(tags) if tags else "-"
+    tags_text = ", ".join(map(str, tags)) if tags else "-"
     activity_line = "New topic" if delta_posts <= 0 else f"New replies: `+{delta_posts}`"
 
+    if dry_run:
+        print(
+            "[DRY-RUN] Slack 미전송. 실제로 보냈을 내용:\n"
+            + (f"  (thread reply to {thread_ts})\n" if thread_ts else "")
+            + f"  {mention if not thread_ts else ''} {title}\n"
+            f"  URL: {url}\n"
+            f"  Author: {author_name} (@{author_username})\n"
+            f"  Tags: {tags_text}\n"
+            f"  Type: {activity_line}\n"
+            f"  Time: {event_time}"
+        )
+        return
+
+    slack_title = escape(title, quote=False)
+    title_link = f"*<{url}|{slack_title}>*"
     payload = {
         "blocks": [
             {"type": "header", "text": {"type": "plain_text", "text": "📢 New activity on FuriosaAI Forum"}},
@@ -170,7 +272,7 @@ def post_to_slack(
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"{mention} *<{url}|{title}>*\n"
+                        f"{mention} {title_link}\n"
                         f"• Author: `{author_name}`\n"
                         f"• Tags: `{tags_text}`\n"
                         f"• Type: {activity_line}\n"
@@ -182,112 +284,272 @@ def post_to_slack(
         ]
     }
 
-    resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT_SEC)
-    resp.raise_for_status()
+    if thread_ts:
+        # 원글 알림의 스레드 답글: 채널 전체 알림(@channel)과 큰 제목은 빼고 같은 내용만
+        payload = {
+            "thread_ts": thread_ts,
+            "text": f"{activity_line.replace('`', '')} - {slack_title}",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"{title_link}\n"
+                            f"• Author: `{author_name}`\n"
+                            f"• Type: {activity_line}\n"
+                            f"• Time: `{event_time}`"
+                        ),
+                    },
+                },
+            ],
+        }
+
+    # 포럼 링크 미리보기(본문 카드)는 붙이지 않음
+    payload["unfurl_links"] = False
+    payload["unfurl_media"] = False
+
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT_SEC)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        reason = f"HTTP {exc.response.status_code}" if exc.response is not None else type(exc).__name__
+        raise RuntimeError(f"Slack webhook delivery failed ({reason})") from None
 
 
-def main() -> int:
-    if not SLACK_WEBHOOK_URL:
+def find_topic_message_ts(tid: int) -> Optional[str]:
+    """채널에서 이 topic 의 원글 알림(New topic) 메시지 ts 를 찾는다. 없으면 가장 오래된 같은 글 알림, 그것도 없으면 None."""
+    if not (SLACK_BOT_TOKEN and FORUM_CHANNEL_ID):
+        return None
+    pat = re.compile(r"forums\.furiosa\.ai/t/[^/|>\s]+/%d(?:[|>/]|$)" % tid)
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    found: Optional[str] = None
+    cursor = None
+    for _ in range(THREAD_LOOKUP_PAGES):
+        params: Dict[str, Any] = {"channel": FORUM_CHANNEL_ID, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = requests.get("https://slack.com/api/conversations.history", headers=headers,
+                                params=params, timeout=TIMEOUT_SEC).json()
+        except Exception as e:
+            print(f"WARN: conversations.history failed: {e}", file=sys.stderr)
+            return found
+        if not data.get("ok"):
+            print(f"WARN: conversations.history failed: {data.get('error')}", file=sys.stderr)
+            return found
+        for m in data.get("messages") or []:  # 최신순
+            blob = (m.get("text") or "") + json.dumps(m.get("blocks") or [], ensure_ascii=False).replace("\\/", "/")
+            if pat.search(blob):
+                found = m["ts"]
+                if "New topic" in blob:
+                    return found
+        cursor = (data.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    return found
+
+
+def flush_notifications(state: Dict[str, Any], dry_run: bool) -> int:
+    pending = state.get("pending_notifications", [])
+    if not pending:
+        return 0
+
+    pending.sort(key=lambda event: parse_iso(event["event_time"]))
+    thread_map = state.setdefault("topic_thread_ts", {})
+    notified = 0
+
+    while pending and is_posting_time():
+        event = pending[0]
+        tid = event["topic_id"]
+        delta = event["delta_posts"]
+        thread_ts = None
+        if delta:
+            thread_ts = thread_map.get(str(tid)) or find_topic_message_ts(tid)
+            if not is_posting_time():
+                break
+            if thread_ts:
+                thread_map[str(tid)] = thread_ts
+            elif event.get("thread_lookup_retries") and SLACK_BOT_TOKEN and FORUM_CHANNEL_ID and not dry_run:
+                # 함께 대기하던 원글이 Slack 조회에 나타날 때까지 잠시 기다린다.
+                event["thread_lookup_retries"] -= 1
+                save_state(state)
+                break
+
+        post_to_slack(
+            SLACK_WEBHOOK_URL,
+            title=event["title"],
+            url=event["url"],
+            event_time=iso_utc_to_kst_str(event["event_time"]),
+            author_username=event["author_username"],
+            author_name=event["author_name"],
+            tags=event["tags"],
+            delta_posts=delta,
+            dry_run=dry_run,
+            thread_ts=thread_ts,
+        )
+        pending.pop(0)
+        if not dry_run:
+            save_state(state)
+        if delta:
+            thread = f" in thread {thread_ts}" if thread_ts else ""
+            print(f"Notified replies: {tid} {event['title']} (+{delta}){thread}")
+        else:
+            print(f"Notified new topic: {tid} {event['title']}")
+        notified += 1
+
+    return notified
+
+
+def run_once(dry_run: bool = False) -> int:
+    if not STATE_PATH:
+        print("ERROR: STATE_PATH env var is required.", file=sys.stderr)
+        return 2
+    if not dry_run and not SLACK_WEBHOOK_URL:
         print("ERROR: SLACK_WEBHOOK_URL env var is required.", file=sys.stderr)
         return 2
 
+    if dry_run:
+        print("=== DRY-RUN 모드: Slack 미전송, 상태 저장 안 함 ===")
+
     state = load_state()
 
-    topics, users_by_id = fetch_latest_pages()
+    try:
+        topics, users_by_id = fetch_latest_pages()
+    except requests.RequestException:
+        flush_notifications(state, dry_run)
+        raise
     if not topics:
         print("No topics found.")
+        flush_notifications(state, dry_run)
         return 0
 
-    # 최초 실행: 기준만 세팅하고 알림은 보내지 않음
-    if not state.get("initialized_at"):
-        state["initialized_at"] = now_utc_iso()
-        topic_posts_count: Dict[str, int] = state.get("topic_posts_count", {})
+    def highest_post_number(t: Dict[str, Any]) -> int:
+        # highest_post_number 는 중간 글이 삭제돼도 유지되어 posts_count 보다 강건함
+        hpn = t.get("highest_post_number")
+        if hpn is None:
+            hpn = t.get("posts_count", 0)
+        return int(hpn or 0)
+
+    # 최초 실행 또는 기존 상태 마이그레이션(topic_highest_post_number 미존재):
+    # 알림 없이 현재 상태를 baseline 으로만 저장한다.
+    # (구버전 topic_posts_count 만 있는 상태에서 재배포 시 과거 글이 전부
+    #  '새 글'로 오인되어 대량 알림이 나가는 것을 방지)
+    if not state.get("initialized_at") or not state.get("topic_highest_post_number"):
+        first_run = not state.get("initialized_at")
+        if first_run:
+            state["initialized_at"] = now_utc_iso()
+        topic_highest: Dict[str, int] = state.get("topic_highest_post_number", {}) or {}
         for t in topics:
             tid = int(t.get("id", 0))
-            pc = int(t.get("posts_count", 0) or 0)
             if tid:
-                topic_posts_count[str(tid)] = pc
-        state["topic_posts_count"] = topic_posts_count
-        save_state(state)
-        print(f"Initialized state (no notifications). initialized_at={state['initialized_at']}")
+                topic_highest[str(tid)] = highest_post_number(t)
+        state["topic_highest_post_number"] = topic_highest
+        if not dry_run:
+            save_state(state)
+        if first_run:
+            print(f"Initialized state (no notifications). initialized_at={state['initialized_at']}")
+        else:
+            print("Migrated to topic_highest_post_number (no notifications).")
         return 0
 
     initialized_at = parse_iso(state["initialized_at"])
-    topic_posts_count: Dict[str, int] = state.get("topic_posts_count", {}) or {}
-
-    def activity_key(t: Dict[str, Any]) -> str:
-        return t.get("last_posted_at") or t.get("bumped_at") or t.get("created_at") or ""
-
-    topics.sort(key=activity_key)
-
-    notified = 0
+    topic_highest: Dict[str, int] = state.get("topic_highest_post_number", {}) or {}
+    pending = state.setdefault("pending_notifications", [])
+    pending_topic_ids = {event["topic_id"] for event in pending if not event["delta_posts"]}
 
     for t in topics:
         tid = int(t.get("id", 0))
         if not tid:
             continue
 
-        title = t.get("title", "(no title)")
-        url = topic_url(t)
+        current_hpn = highest_post_number(t)
+        prev_hpn = topic_highest.get(str(tid))
 
-        tags = t.get("tags") or []
-        if not isinstance(tags, list):
-            tags = []
-
-        author_username, author_name = get_original_poster(t, users_by_id)
-
-        current_pc = int(t.get("posts_count", 0) or 0)
-        prev_pc = topic_posts_count.get(str(tid))
-
-        if prev_pc is None:
-            topic_posts_count[str(tid)] = current_pc
-
-            created_at_raw = t.get("created_at")
-            if created_at_raw:
-                created_at = parse_iso(created_at_raw)
-                if created_at > initialized_at:
-                    post_to_slack(
-                        SLACK_WEBHOOK_URL,
-                        title=title,
-                        url=url,
-                        event_time=iso_utc_to_kst_str(created_at_raw),
-                        author_username=author_username,
-                        author_name=author_name,
-                        tags=tags,
-                        delta_posts=0,
-                    )
-                    print(f"Notified new topic: {tid} {title}")
-                    notified += 1
+        # 글 삭제로 감소한 경우도 최신값을 저장해야 이후 댓글을 놓치지 않는다.
+        topic_highest[str(tid)] = current_hpn
+        if prev_hpn is None:
+            event_time = t.get("created_at")
+            if not event_time or parse_iso(event_time) <= initialized_at:
+                continue
+            delta = 0
+            author_username, author_name = get_original_poster(t, users_by_id)
+        elif current_hpn > prev_hpn:
+            delta = current_hpn - prev_hpn
+            author_username, author_name = get_latest_poster(t, users_by_id)
+            event_time = t.get("last_posted_at") or t.get("bumped_at") or now_utc_iso()
+        else:
             continue
 
-        if current_pc > prev_pc:
-            delta = current_pc - prev_pc
+        event = {
+            "topic_id": tid,
+            "title": t.get("title", "(no title)"),
+            "url": topic_url(t),
+            "event_time": event_time,
+            "author_username": author_username,
+            "author_name": author_name,
+            "tags": normalize_tags(t.get("tags")),
+            "delta_posts": delta,
+        }
+        if delta and tid in pending_topic_ids:
+            event["thread_lookup_retries"] = QUEUED_THREAD_LOOKUP_RETRIES
+        pending.append(event)
 
-            topic_posts_count[str(tid)] = current_pc
+    state["topic_highest_post_number"] = topic_highest
+    if not dry_run:
+        save_state(state)
 
-            event_time = t.get("last_posted_at") or t.get("bumped_at") or now_utc_iso()
+    notified = flush_notifications(state, dry_run)
+    print(f"Done. notified={notified} queued={len(pending)}" + (" (dry-run, 상태 미저장)" if dry_run else ""))
+    return 0
 
-            post_to_slack(
-                SLACK_WEBHOOK_URL,
-                title=title,
-                url=url,
-                event_time=iso_utc_to_kst_str(event_time),
-                author_username=author_username,
-                author_name=author_name,
-                tags=tags,
-                delta_posts=delta,
-            )
-            print(f"Notified replies: {tid} {title} (+{delta})")
-            notified += 1
-        else:
-            topic_posts_count[str(tid)] = max(prev_pc, current_pc)
 
-    state["topic_posts_count"] = topic_posts_count
-    save_state(state)
+def cli_main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loop", action="store_true", help="Run forever (daemon mode)")
+    parser.add_argument("--interval-sec", type=int, default=60, help="Polling interval in seconds")
+    parser.add_argument("--dry-run", action="store_true", help="Slack 미전송·상태 미저장. 무엇을 보낼지 출력만 함")
+    args = parser.parse_args()
 
-    print(f"Done. notified={notified}")
+    if not args.loop:
+        return run_once(dry_run=args.dry_run)
+
+    print(f"Posting window: {POSTING_START_HOUR:02d}:00-{POSTING_END_HOUR:02d}:00 KST")
+    # k8s 종료(SIGTERM) 들어오면 while 탈출하도록 처리
+    keep_running = True
+
+    def _handle_sigterm(signum, frame):
+        nonlocal keep_running
+        keep_running = False
+
+    try:
+        import signal
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+        signal.signal(signal.SIGINT, _handle_sigterm)
+    except Exception:
+        pass
+
+    while keep_running:
+        try:
+            rc = run_once(dry_run=args.dry_run)
+            # run_once가 2(설정오류) 같은 치명적 오류면 계속 돌 의미가 없으니 종료
+            if rc == 2:
+                print("Fatal config error. Exiting.", file=sys.stderr)
+                break
+        except Exception:
+            import traceback
+            print("ERROR: run_once failed.", file=sys.stderr)
+            traceback.print_exc()
+
+        # sleep 중에도 SIGTERM 받으면 빨리 종료되도록 1초 단위로 쪼갬
+        for _ in range(max(1, args.interval_sec)):
+            if not keep_running:
+                break
+            time.sleep(1)
+
+    print("Exiting daemon loop.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
